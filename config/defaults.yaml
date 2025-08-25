@@ -1,0 +1,9 @@
+storage:
+   fs:
+      root: &root ${PROJECT_DIR}
+      folders:
+         data: !joinPath [*root, "data"]
+
+log:
+   defaults: !joinPath [*root, "confs", "logConfDefaults.yaml"]
+   file: !joinPath [*root, "confs", "logConfDev.yaml"]

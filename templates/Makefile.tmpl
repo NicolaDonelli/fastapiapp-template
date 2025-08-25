@@ -1,0 +1,216 @@
+# Signifies our desired python version
+# Makefile macros (or variables) are defined a little bit differently than traditional bash, keep in mind that in the Makefile there's top-level Makefile-only syntax, and everything else is bash script syntax.
+PYTHON = python
+SHELL = /bin/bash
+
+# .PHONY defines parts of the makefile that are not dependant on any specific file
+# This is most often used to store functions
+.PHONY = help
+
+src := app
+port := {{PORT}}
+doc_files = $(shell find sphinx/ -name "*.*")
+app_files = $(shell find app/ -type f -name '*.py')
+config_files = $(shell find config/ -type f -name '*.yaml')
+
+
+# Uncomment to store cache installation in the environment
+# cache_dir := $(shell python -c 'import site; print(site.getsitepackages()[0])')
+cache_dir := .make_cache
+project_name = $(shell python -c "import tomli;from pathlib import Path;print(tomli.loads(Path('pyproject.toml').read_text(encoding='utf-8'))['project']['name'])")
+version = $(shell python -c "from importlib.metadata import version;print(version('$(project_name)'))")
+
+$(shell mkdir -p $(cache_dir))
+
+pre_deps_tag := $(cache_dir)/.pre_deps
+env_tag := $(cache_dir)/.env_tag
+env_dev_tag := $(cache_dir)/.env_dev_tag
+install_tag := $(cache_dir)/.install_tag
+docker_build_tag := $(cache_dir)/.docker_build_tag
+
+image_name := eu.gcr.io/{{PROJECT_ID_DEV}}/$(project_name)
+
+# ======================
+# Rules and Dependencies
+# ======================
+
+help:
+	@echo "---------------HELP-----------------"
+	@echo "Package Name: $(app_name)"
+	@echo " "
+	@echo "Type 'make' followed by one of these keywords:"
+	@echo " "
+	@echo "  - reqs_dev to build closed development requirements, requirements/requirements_dev.txt, from requirements/requirements_dev.in and requirements/requirements.in"
+	@echo "  - reqs to build closed minimal requirements, requirements/requirements.txt, from requirements/requirements.in"
+	@echo "  - setup to install application requirements"
+	@echo "  - setup_dev to install development requirements"
+	@echo "  - format to reformat files to adhere to standards defined in pyproject.toml"
+	@echo "  - check_format to check formatting standards defined in pyproject.toml"
+	@echo "  - dist to build a tar.gz distribution"
+	@echo "  - tests to run unittests using pytest as configured in pyproject.toml"
+	@echo "  - lint to perform linting using flake8 as configured in pyproject.toml"
+	@echo "  - mypy to perform static type checking using mypy as configured in pyproject.toml"
+	@echo "  - bandit to find security issues in app code using bandit as configured in pyproject.toml"
+	@echo "  - licensecheck to check dependencies licences compatibility with application license using licensecheck as configured in pyproject.toml"
+	@echo "  - docs to produce documentation in html format using sphinx as configured in pyproject.toml"
+	@echo "  - checks to run check_format, mypy, lint, bandit, licensecheck and tests altogether"
+	@echo "  - changelogs for compiling changelogs using git-cliff as configured in pyproject.toml"
+	@echo "  - clean to remove cache files"
+	@echo "  - build to build docker image according to Dockerfile, tagged with app version"
+	@echo "  - run to run latest built docker image"
+	@echo "  - tag to create and push on origin a 'development' git tag with current app version"
+	@echo "------------------------------------"
+
+
+$(pre_deps_tag):
+	@echo "==Installing pip-tools, black and pre-commit=="
+	${PYTHON} -m pip install --upgrade --quiet pip setuptools tomli
+	${PYTHON} -m pip install --quiet --group base
+	if [[ -d .git ]] && [[ ! -s .git/hooks/pre-commit ]]; then pre-commit install; fi;
+	if [[ -d .git ]] && [[ ! -s .git/hooks/commit-msg ]]; then pre-commit install --hook-type commit-msg; fi;
+	if [[ -d .git ]] && [[ ! -s .git/hooks/pre-push ]]; then pre-commit install --hook-type pre-push; fi;
+	touch $(pre_deps_tag)
+
+requirements/requirements_dev.txt: pyproject.toml $(pre_deps_tag)
+	@echo "==Compiling requirements_dev.txt=="
+	uv pip compile \
+		--output-file requirements/requirements_dev.txt \
+		--no-emit-index-url \
+		--all-extras \
+		--quiet \
+		--group dev \
+		pyproject.toml
+
+reqs_dev: requirements/requirements_dev.txt
+
+requirements/requirements.txt: requirements/requirements_dev.txt
+	@echo "==Compiling requirements.txt=="
+	uv pip compile \
+		--output-file requirements/requirements.txt \
+		--constraints requirements/requirements_dev.txt \
+		--no-emit-index-url \
+		--all-extras \
+		--quiet \
+		pyproject.toml
+
+reqs: requirements/requirements.txt
+
+$(env_tag): requirements/requirements.txt
+	@echo "==Installing requirements.txt=="
+	uv pip sync --quiet requirements/requirements.txt
+	rm -f $(env_dev_tag)
+	rm -f $(install_tag)
+	touch $(env_tag)
+
+$(env_dev_tag): requirements/requirements_dev.txt
+	@echo "==Installing requirements_dev.txt=="
+	uv pip sync --quiet requirements/requirements_dev.txt
+	rm -f $(env_tag)
+	rm -f $(install_tag)
+	touch $(env_dev_tag)
+
+setup: $(env_tag)
+
+setup_dev: $(env_dev_tag)
+
+$(build_tag): $(files) pyproject.toml requirements/requirements.txt
+	@echo "==Building package distribution=="
+	uv build --no-build-logs
+	ls -rt  dist/*.tar.gz | tail -1 > $(build_tag)
+
+build: $(build_tag)
+
+$(install_tag): build
+	@echo "==Installing package=="
+	uv pip install --quiet $(shell ls -rt  dist/*.tar.gz | tail -1)
+	ls -rt  dist/*.tar.gz | tail -1 > $(install_tag)
+
+uninstall:
+	@echo "==Uninstalling all packages=="
+	uv pip sync --allow-empty-requirements --quiet /dev/null
+	@echo "==Removing all tags=="
+	rm -f $(env_tag) $(env_dev_tag) $(pre_deps_tag) $(install_tag)
+
+install: setup $(install_tag)
+
+install_dev: setup_dev $(install_tag)
+
+format: setup_dev
+	${PYTHON} -m ruff format
+
+check_format: setup_dev
+	${PYTHON} -m ruff format --check
+
+check_lint: setup_dev
+	${PYTHON} -m ruff check --no-fix
+	pydoclint $(src)
+
+lint: setup_dev
+	${PYTHON} -m ruff check --fix
+
+mypy: setup_dev
+	${PYTHON} -m mypy --install-types --non-interactive
+
+tests: setup_dev
+	${PYTHON} -m pytest --numprocesses auto --dist loadfile
+
+licensecheck: setup_dev
+	${PYTHON} -m licensecheck
+
+checks: check_format check_lint mypy licensecheck tests
+
+changelog: setup_dev build
+	@if expr $(version) : '.*dev.*' > /dev/null; then echo "This is a temporary version, $(version). We do not generate changelogs for temporary versions."; exit 1; \
+	else git cliff --config pyproject.toml; fi
+
+docs: install_dev $(doc_files) pyproject.toml
+	sphinx-apidoc -f -o sphinx/source/api $(src)
+	make --directory=sphinx --file=Makefile clean html
+
+clean: uninstall
+	@echo "==Cleaning environment=="
+	uv cache clean
+	rm -rf \
+		dist \
+		docs \
+		build \
+		*.egg-info \
+		.mypy_cache \
+		.pytest_cache \
+		.make_cache \
+		$(shell find . -name "*.pyc" -not -path "./venv/*") \
+		$(shell find . -name "__pycache__" -not -path "./venv/*")
+
+$(docker_build_tag): Dockerfile requirements/requirements.txt pyproject.toml $(app_files) $(config_files)
+	TAG=$$(${PYTHON} -c "print('$(version)'.replace('+','.'))"); \
+	DOCKER_TAG=$$(cat $(docker_build_tag)); \
+	if [[ "$${DOCKER_TAG}" != "$${TAG}" ]]; then \
+	  set -e; \
+	  echo "==Building docker container with ENV=dev and APP_VERSION=$(version)=="; \
+	  docker build -t $(image_name):"$${TAG}" --build-arg APP_VERSION=$(version) .; \
+	  echo "==Updating docker version tag=="; \
+	  echo "$${TAG}" > $(docker_build_tag); \
+	else \
+	  echo "==Image '$(image_name):$${TAG}' already exists, nothing to do=="; \
+	fi
+
+
+build: $(docker_build_tag)
+
+run: $(docker_build_tag)
+	@echo "==Run docker image '$(project_name)' from '$(image_name):$$(cat $(docker_build_tag))' container on 127.0.0.1:8080=="
+	docker run --env PORT=$(port) --rm -it -p 127.0.0.1:8080:$(port) --name $(project_name) $(image_name):$$(cat $(docker_build_tag))
+
+tag: $(install_tag)
+	git fetch --tags origin; \
+	TAGS=$$(git tag); \
+	if [[ " $${TAGS} " =~ " v$(version) " ]]; then \
+		echo "==Tag v$(version) already exists, nothing to do=="; \
+		exit 1; \
+	elif [[ $(version) =~ .*\.d[0-9]{8}$$ ]]; then \
+		echo "==Version $(version) is dirty, not creating tag =="; \
+		exit 1; \
+	else \
+		echo "==Version $(version) is fine, creating tag=="; \
+		git tag -a "v$(version)" -m "Version $(version)"; git push origin "v$(version)"; \
+	fi

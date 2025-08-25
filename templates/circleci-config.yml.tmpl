@@ -1,0 +1,166 @@
+version: 2.1
+orbs:
+  gcp-gcr: circleci/gcp-gcr@0.15.0
+  gcp-cloud-run: circleci/gcp-cloud-run@1.0.2
+
+executors:
+  python-container:
+    docker:
+      # using buster images instead of slim-buster since we need libpq-dev, make, gcc and git
+      - image: python:{{PYTHON_VERSION}}-buster
+
+jobs:
+  check:
+    parameters:
+      env:
+        type: string
+    executor: python-container
+    steps:
+      - checkout
+      - run:
+          environment:
+            ENV: << parameters.env >>
+            PROJECT_DIR: "/root/project"
+          command: make checks
+
+  build-test-push-deploy-container:
+    executor: gcp-gcr/default
+    parameters:
+      env:
+        type: string
+      cpu:
+        type: integer
+      web-concurrency:
+        type: integer
+      concurrency:
+        type: integer
+    environment:
+        ENV: << parameters.env >>
+        CPU: << parameters.cpu >>
+        WEB_CONCURRENCY: << parameters.web-concurrency >>
+        CONCURRENCY: << parameters.concurrency >>
+        DOCKERFILE: Dockerfile
+        GOOGLE_COMPUTE_REGION: europe-west1
+        IMAGE: {{PROJECT_NAME}}-<< parameters.env >>
+        REGISTRY: eu.gcr.io
+    steps:
+      - checkout
+      - run:
+          name: Set environment variables
+          command: |
+            ENV=<< parameters.env >>
+            echo "${GIT_CREDENTIALS}" >> api_keys/.git_credentials
+            echo 'export APP_VERSION=$(git describe)' >> $BASH_ENV
+            if [[ ${ENV} == 'dev' ]]; then 
+              echo 'export GOOGLE_PROJECT_ID="{{PROJECT_ID_DEV}}"' >> $BASH_ENV
+              echo 'export SERVICE_ACCOUNT="{{SERVICE_ACCOUNT_DEV}}@a{{PROJECT_ID_DEV}}.iam.gserviceaccount.com"' >> $BASH_ENV
+#              echo 'export GCLOUD_SERVICE_KEY="${GCLOUD_SERVICE_KEY_DEV}"' >> $BASH_ENV
+              echo 'export GCLOUD_SERVICE_KEY={{SERVICE_ACCOUNT_DEV}}:latest"' >> $BASH_ENV
+            elif [[ ${ENV} == 'prod' ]]; then 
+              echo 'export GOOGLE_PROJECT_ID="{{PROJECT_ID_PROD}}"' >> $BASH_ENV
+              echo 'export SERVICE_ACCOUNT="{{SERVICE_ACCOUNT_PROD}}@{{PROJECT_ID_PROD}}.iam.gserviceaccount.com"' >> $BASH_ENV
+#              echo 'export GCLOUD_SERVICE_KEY="${GCLOUD_SERVICE_KEY_PROD}"' >> $BASH_ENV
+              echo 'export GCLOUD_SERVICE_KEY={{SERVICE_ACCOUNT_PROD}}:latest"' >> $BASH_ENV
+            else
+              echo "'env' parameter should be 'prod' or 'test', instead it is '${ENV}'"
+              exit 1
+            fi
+
+      - gcp-gcr/build-image:
+          dockerfile: $DOCKERFILE
+          registry-url: $REGISTRY
+          image: $IMAGE
+          tag: $CIRCLE_SHA1
+          extra_build_args: "--build-arg ENV=$ENV --build-arg WEB_CONCURRENCY=$WEB_CONCURRENCY --build-arg APP_VERSION=${APP_VERSION} --platform linux/amd64"
+      - run:
+          name: Container sanity check using Trivy
+          command: |
+            sudo apt install -y curl
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+            trivy image --exit-code 1 --no-progress --ignore-unfixed --scanners vuln,config,secret $REGISTRY/$GOOGLE_PROJECT_ID/$IMAGE:$CIRCLE_SHA1
+      - gcp-gcr/gcr-auth:
+          registry-url: $REGISTRY
+      - gcp-gcr/push-image:
+          registry-url: $REGISTRY
+          image: $IMAGE
+          tag: $CIRCLE_SHA1
+      - gcp-gcr/tag-image:
+          registry-url: $REGISTRY
+          image: $IMAGE
+          source-tag: $CIRCLE_SHA1
+          target-tag: latest
+      - run:
+          name: Deploy on CloudRun
+          command: |
+            gcloud components update --quiet
+            gcloud beta run deploy $IMAGE \
+              --image $REGISTRY/$GOOGLE_PROJECT_ID/$IMAGE:$CIRCLE_SHA1 \
+              --region $GOOGLE_COMPUTE_REGION \
+              --allow-unauthenticated \
+              --platform managed \
+              --memory 8Gi \
+              --port 8080 \
+              --cpu $CPU \
+              --concurrency $CONCURRENCY \
+              --set-env-vars ENV=$ENV \
+              --service-account ${SERVICE_ACCOUNT} \
+              --set-secrets GCLOUD_SERVICE_KEY=${GCLOUD_SERVICE_KEY} \
+              --description '{{PROJECT_DESCRIPTION}}'
+
+            echo "================"
+            echo "Service deployed"
+            echo "================"
+            GET_GCP_DEPLOY_ENDPOINT=$(gcloud beta run services describe $IMAGE --platform managed --region $GOOGLE_COMPUTE_REGION --format="value(status.address.url)")
+            echo "export GCP_DEPLOY_ENDPOINT=$GET_GCP_DEPLOY_ENDPOINT" >> $BASH_ENV
+            source $BASH_ENV
+            echo $GCP_DEPLOY_ENDPOINT
+
+workflows:
+  version: 2
+  CI:
+    jobs:
+      - check:
+          name: "check"
+          matrix:
+            parameters:
+              env: [ dev ]
+  CD:
+    jobs:
+      - check:
+          name: "check"
+          matrix:
+            parameters:
+              env: [ dev, prod ]
+          filters: &filter-tags
+            tags:
+              # Match only tags of the form v0.0.0*, produced by `make tags` for releases in dev env (v0.0.0+0.########)
+              only: /^v\d+\.\d+\.\d+.*$/ # /^v(?!\.)(\d+(\.\d+)+)(?![\d\.]).*$/
+            branches:
+              ignore: /.*/
+
+      - build-test-push-deploy-container:
+          name: Build, test, push and deploy on test environment
+          env: dev
+          cpu: 4
+          web-concurrency: 4
+          concurrency: 4
+          requires:
+            - check
+          filters:
+            <<: *filter-tags
+
+      - build-test-push-deploy-container:
+          name: Build, test, push and deploy on Prod environment
+          env: prod
+          cpu: 4
+          web-concurrency: 4
+          concurrency: 4
+          requires:
+            - check
+          filters:
+            tags:
+              # Match only tags of the form v0.0.0
+              only: /^v\d+\.\d+\.\d+$/ #/^v(?!\.)(\d+(\.\d+)+)(?![\d\.])$/
+            branches:
+              ignore: /.*/
+

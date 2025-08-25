@@ -1,0 +1,8 @@
+storage:
+   fs:
+      root: &root ${PROJECT_DIR}
+      folders:
+         data: !joinPath [*root, "data"]
+
+log:
+   file: !joinPath [*root, "config", "logConfProd.yaml"]

@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+ARG APP_PORT=8000
+ARG ENV=dev
+
+FROM python:{{PYTHON_VERSION}}-buster as build
+ARG APP_VERSION
+
+WORKDIR /builder
+COPY app app
+COPY config config
+COPY requirements requirements
+COPY LICENSE MANIFEST.in pyproject.toml README.md Makefile ./
+
+RUN python -m pip install --quiet --upgrade pip
+RUN python -m pip install --quiet uv
+RUN uv venv --link-mode copy
+RUN uv pip install --upgrade pip
+ENV PATH /builder/.venv/bin:$PATH
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=$APP_VERSION
+
+# This section is required if you application requires dependencies hosted on private repositories 
+RUN git config --global credential.helper 'store --file=/root/.git_credentials'
+COPY api_keys/.git_credentials /root/.git_credentials
+RUN chmod 600 /root/.git_credentials
+
+RUN make install
+
+
+FROM python:{{PYTHON_VERSION}}-slim-bullseye
+ARG ENV=dev
+
+RUN groupadd -g 999 python && useradd -m -r -u 999 -g python python
+RUN mkdir /runner && chown python:python /runner
+
+WORKDIR /runner
+
+COPY --chown=python:python --from=build /builder/.venv ./.venv
+COPY --chown=python:python config ./config
+
+RUN mkdir logs && chown python:python logs
+
+USER 999
+ENV PATH /runner/.venv/bin:$PATH
+
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED True
+
+ENV PROJECT_DIR /runner
+ENV ENV $ENV
+
+# The PORT env variable is set either as environment variable or by `gcloud beta run deploy` command --port argument
+EXPOSE ${PORT:-8080}
+
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD curl -f http://localhost:${PORT}/system/health
+
+CMD python -m uvicorn app.main:appfactory.app --host 0.0.0.0 --port ${PORT} --reload

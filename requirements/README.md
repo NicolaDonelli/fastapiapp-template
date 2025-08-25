@@ -1,0 +1,1 @@
+This folder contains the closed requirements of the application.

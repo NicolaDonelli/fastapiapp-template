@@ -1,0 +1,30 @@
+################
+Installation
+################
+
+.. contents:: Table of Contents
+
+
+**********************
+Package Configurations
+**********************
+
+.. literalinclude:: ../../../pyproject.toml
+
+**********
+How to run
+**********
+
+In local environment
+
+.. code-block:: bash
+
+    python -m uvicorn app.main:appfactory.app --host 0.0.0.0 --port {{PORT}} --reload
+
+Inside container
+
+.. code-block:: bash
+
+    make docker_build
+    make docker_run
+

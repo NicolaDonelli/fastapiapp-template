@@ -1,0 +1,17 @@
+params:
+    path: &path ${PROJECT_DIR}/logs/dev
+
+
+handlers:
+
+    regular_file_handler:
+        filename: !joinPath [ *path, "regular.log" ]
+
+    extended_file_handler:
+        filename: !joinPath [ *path, "extended.log" ]
+
+    error_file_handler:
+        filename: !joinPath [ *path, "errors.log" ]
+
+    warn_file_handler:
+        filename: !joinPath [ *path, "warn.log" ]
